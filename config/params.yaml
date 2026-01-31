@@ -1,0 +1,65 @@
+# 交易参数配置
+
+# Opening Range 设置
+opening_range:
+  or5_minutes: 5 # OR5 窗口（分钟）
+  or15_minutes: 15 # OR15 窗口（分钟）
+
+# VWAP 参数
+vwap:
+  band_pct: 0.002 # VWAP band 宽度 (0.2%)
+  atr_band_multiplier: 0.5 # ATR 倍数作为 band
+
+# 日类型分类阈值
+regime:
+  # 趋势日判定
+  trend:
+    vwap_same_side_pct: 0.70 # 70%时间在VWAP同侧
+    or_breakout_hold_pct: 0.60 # OR突破后持续60%时间
+    min_range_atr_ratio: 1.2 # 当日波动至少1.2倍ATR
+
+  # 震荡日判定
+  range:
+    vwap_cross_min: 4 # VWAP穿越至少4次
+    or_false_breakout_count: 2 # OR假突破至少2次
+    max_range_atr_ratio: 0.8 # 当日波动不超过0.8倍ATR
+
+  # 事件日
+  event:
+    early_volume_ratio: 2.0 # 开盘30分钟成交量是平时2倍以上
+    gap_pct: 0.015 # 缺口超过1.5%
+
+# 交易时间窗口 (ET时区)
+trading_windows:
+  market_open: "09:30"
+  market_close: "16:00"
+  no_trade_open: "09:30" # 不交易期开始
+  no_trade_open_end: "09:45" # 不交易期结束
+
+  # 允许交易的窗口
+  allowed_windows:
+    - start: "09:45"
+      end: "11:00"
+      priority: high
+    - start: "13:30"
+      end: "15:30"
+      priority: medium
+
+  # 收盘前禁止新开仓
+  close_only_start: "15:45"
+
+# 风控参数
+risk:
+  max_daily_loss_r: 2.0 # 日内最大亏损 R
+  max_trades_per_day: 2 # 每日最多交易次数
+  max_position_pct: 0.04 # 单笔最大仓位 (4%)
+  cooldown_minutes: 15 # 止损后冷静期（分钟）
+
+# 移动平均
+ma:
+  daily_ma_period: 20 # 日线MA周期
+
+# ATR 计算
+atr:
+  period: 14 # ATR周期（日线）
+  intraday_period: 20 # 日内ATR周期（1m bars）

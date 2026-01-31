@@ -1,0 +1,24 @@
+# 交易标的配置
+symbols:
+  - symbol: QQQM
+    exchange: SMART
+    currency: USD
+    sec_type: STK
+    description: "Invesco NASDAQ 100 ETF"
+
+  - symbol: AAPL
+    exchange: SMART
+    currency: USD
+    sec_type: STK
+    description: "Apple Inc."
+
+  - symbol: MU
+    exchange: SMART
+    currency: USD
+    sec_type: STK
+    description: "Micron Technology"
+
+# 默认监控标的
+default_symbols:
+  - QQQM
+  - AAPL

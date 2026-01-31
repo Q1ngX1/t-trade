@@ -1,0 +1,94 @@
+# 事件日历与禁止交易日
+# 手动维护，定期更新
+
+# 2024年重要经济事件
+events_2024:
+  # FOMC 会议日（禁止交易或降低仓位）
+  fomc:
+    - date: "2024-01-31"
+      description: "FOMC Meeting"
+      action: no_trade
+    - date: "2024-03-20"
+      description: "FOMC Meeting"
+      action: no_trade
+    - date: "2024-05-01"
+      description: "FOMC Meeting"
+      action: no_trade
+    - date: "2024-06-12"
+      description: "FOMC Meeting"
+      action: no_trade
+    - date: "2024-07-31"
+      description: "FOMC Meeting"
+      action: no_trade
+    - date: "2024-09-18"
+      description: "FOMC Meeting"
+      action: no_trade
+    - date: "2024-11-07"
+      description: "FOMC Meeting"
+      action: no_trade
+    - date: "2024-12-18"
+      description: "FOMC Meeting"
+      action: no_trade
+
+  # CPI 发布日（谨慎交易）
+  cpi:
+    - date: "2024-01-11"
+      action: reduce_size
+    - date: "2024-02-13"
+      action: reduce_size
+    - date: "2024-03-12"
+      action: reduce_size
+
+  # 非农就业数据（每月第一个周五）
+  nfp:
+    - date: "2024-01-05"
+      action: reduce_size
+    - date: "2024-02-02"
+      action: reduce_size
+    - date: "2024-03-08"
+      action: reduce_size
+
+# 市场假日（不交易）
+holidays_2024:
+  - date: "2024-01-01"
+    name: "New Year's Day"
+  - date: "2024-01-15"
+    name: "Martin Luther King Jr. Day"
+  - date: "2024-02-19"
+    name: "Presidents' Day"
+  - date: "2024-03-29"
+    name: "Good Friday"
+  - date: "2024-05-27"
+    name: "Memorial Day"
+  - date: "2024-06-19"
+    name: "Juneteenth"
+  - date: "2024-07-04"
+    name: "Independence Day"
+  - date: "2024-09-02"
+    name: "Labor Day"
+  - date: "2024-11-28"
+    name: "Thanksgiving"
+  - date: "2024-12-25"
+    name: "Christmas Day"
+
+# 半天交易日
+half_days_2024:
+  - date: "2024-07-03"
+    close_time: "13:00"
+  - date: "2024-11-29"
+    close_time: "13:00"
+  - date: "2024-12-24"
+    close_time: "13:00"
+
+# 个股财报日（如果交易该股票则禁止）
+earnings:
+  AAPL:
+    - date: "2024-02-01"
+      action: no_trade
+    - date: "2024-05-02"
+      action: no_trade
+  MU:
+    - date: "2024-03-20"
+      action: no_trade
+    - date: "2024-06-26"
+      action: no_trade
