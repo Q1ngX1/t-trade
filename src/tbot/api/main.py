@@ -24,6 +24,8 @@ from pydantic import BaseModel
 from tbot.api.watchlist import WatchlistManager
 from tbot.indicators import VWAP, OpeningRange, calculate_vwap
 from tbot.regime import RegimeClassifier, extract_features
+from tbot.services.tws_data_service import TWSDataService, get_tws_service, init_tws_service, stop_tws_service
+from tbot.services.news_event_detector import NewsEventDetector, get_news_detector
 from tbot.settings import get_settings, init_settings
 from tbot.utils import get_market_session, get_trading_progress, is_trading_allowed
 from tbot.utils.time import get_et_now
@@ -56,6 +58,11 @@ class StockStatus(BaseModel):
     name: str  # 股票名称
     exchange: str | None  # 交易所
     price: float
+    prev_close: float | None = None  # 昨收
+    day_high: float | None = None  # 当日最高
+    day_low: float | None = None  # 当日最低
+    day_open: float | None = None  # 当日开盘
+    ma20: float | None = None  # 20日均线
     vwap: float
     vwap_diff_pct: float
     above_vwap: bool
@@ -67,6 +74,9 @@ class StockStatus(BaseModel):
     regime: str
     regime_confidence: float
     regime_reasons: list[str]
+    news_event_score: float = 0.0  # 新闻事件得分
+    news_keywords: list[str] = []  # 检测到的新闻关键词
+    sparkline: list[float] = []  # 今日价格走势 (简化后的价格序列)
     updated_at: str
 
 
@@ -104,20 +114,27 @@ class DataSourceRequest(BaseModel):
 watchlist_manager: WatchlistManager | None = None
 stock_cache: dict[str, StockStatus] = {}
 stock_price_cache: dict[str, dict[str, Any]] = {}  # 缓存真实股票数据
-ibkr_client: Any = None
+tws_service: TWSDataService | None = None  # TWS 数据服务
+news_detector: NewsEventDetector | None = None  # 新闻检测器
 current_data_source: str = "yahoo"  # 当前数据源: yahoo 或 tws
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
-    global watchlist_manager
+    global watchlist_manager, news_detector, tws_service
     
     settings = init_settings()
     watchlist_manager = WatchlistManager(settings.abs_data_dir / "watchlist.json")
+    news_detector = get_news_detector()
     
     logger.info("FastAPI 应用启动")
     yield
+    
+    # 停止 TWS 服务
+    if tws_service is not None:
+        tws_service.stop()
+    
     logger.info("FastAPI 应用关闭")
 
 
@@ -164,17 +181,17 @@ async def health_check():
 @app.get("/api/datasource", response_model=DataSourceStatus)
 async def get_data_source():
     """获取当前数据源状态"""
-    global ibkr_client
+    global tws_service
     
     tws_available = False
     tws_error = None
     
-    if ibkr_client is not None:
-        tws_available = ibkr_client.is_connected
+    if tws_service is not None:
+        tws_available = tws_service.is_connected
         if not tws_available:
-            tws_error = "TWS 连接已断开"
+            tws_error = tws_service.error or "TWS 连接已断开"
     else:
-        tws_error = "TWS 客户端未初始化"
+        tws_error = "TWS 服务未启动"
     
     return DataSourceStatus(
         current=current_data_source,
@@ -186,7 +203,7 @@ async def get_data_source():
 @app.post("/api/datasource", response_model=DataSourceStatus)
 async def set_data_source(request: DataSourceRequest):
     """切换数据源"""
-    global current_data_source, ibkr_client
+    global current_data_source, tws_service
     
     source = request.source.lower()
     
@@ -197,60 +214,37 @@ async def set_data_source(request: DataSourceRequest):
     tws_error = None
     
     if source == "tws":
-        # 尝试连接 TWS（在线程池中运行，需要创建新的事件循环）
-        import concurrent.futures
-        import threading
+        # 使用 TWSDataService 连接
+        if tws_service is None:
+            tws_service = TWSDataService(port=7497, client_id=20)
         
-        # 用于存储结果
-        result = {"success": False, "error": None}
-        
-        def connect_tws_in_thread():
-            """在独立线程中连接 TWS（ib_insync 需要自己的事件循环）"""
-            global ibkr_client
-            import asyncio
-            
-            # 为此线程创建新的事件循环（必须在导入 ib_insync 之前）
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            
-            try:
-                # 在设置好事件循环后再导入和创建 IBKRClient
-                from tbot.brokers.ibkr_client import IBKRClient
-                
-                if ibkr_client is None or not ibkr_client.is_connected:
-                    ibkr_client = IBKRClient(port=7497, client_id=10, timeout=10)
-                    result["success"] = ibkr_client.connect_sync()
-                else:
-                    result["success"] = True
-            except Exception as e:
-                result["error"] = str(e)
-                result["success"] = False
-        
-        try:
-            # 使用 Thread 而不是 ThreadPoolExecutor
-            thread = threading.Thread(target=connect_tws_in_thread)
-            thread.start()
-            thread.join(timeout=15)  # 等待最多 15 秒
-            
-            if thread.is_alive():
-                tws_error = "TWS 连接超时"
-                current_data_source = "yahoo"
-            elif result["success"]:
+        if not tws_service.is_running:
+            success = tws_service.start()
+            if success:
                 tws_available = True
                 current_data_source = "tws"
-                logger.info("成功连接到 TWS，切换数据源为 TWS")
+                
+                # 订阅 Watchlist 中的股票
+                if watchlist_manager:
+                    symbols = watchlist_manager.get_all()
+                    tws_service.subscribe(symbols)
+                
+                logger.info("TWSDataService 已启动，切换数据源为 TWS")
             else:
-                tws_error = result["error"] or "无法连接到 TWS"
+                tws_error = tws_service.error or "无法连接到 TWS"
                 current_data_source = "yahoo"
                 logger.warning(f"TWS 连接失败: {tws_error}")
-        except Exception as e:
-            tws_error = f"TWS 连接错误: {str(e)}"
-            current_data_source = "yahoo"
-            logger.error(f"TWS 连接异常: {e}")
+        else:
+            tws_available = tws_service.is_connected
+            if tws_available:
+                current_data_source = "tws"
+            else:
+                tws_error = tws_service.error or "TWS 连接断开"
+                current_data_source = "yahoo"
     else:
         # 切换回 Yahoo
         current_data_source = "yahoo"
-        if ibkr_client is not None and ibkr_client.is_connected:
+        if tws_service is not None and tws_service.is_connected:
             tws_available = True
     
     return DataSourceStatus(
@@ -263,64 +257,33 @@ async def set_data_source(request: DataSourceRequest):
 @app.post("/api/datasource/connect-tws")
 async def connect_tws(port: int = 7497):
     """手动连接 TWS"""
-    global ibkr_client, current_data_source
+    global tws_service, current_data_source
     
-    import threading
+    # 停止旧服务
+    if tws_service is not None:
+        tws_service.stop()
     
-    result = {"success": False, "error": None}
+    # 创建新服务
+    tws_service = TWSDataService(port=port, client_id=20)
+    success = tws_service.start()
     
-    def do_connect():
-        """在独立线程中连接 TWS"""
-        global ibkr_client
-        import asyncio
+    if success:
+        current_data_source = "tws"
         
-        # 为此线程创建新的事件循环
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        # 订阅 Watchlist
+        if watchlist_manager:
+            symbols = watchlist_manager.get_all()
+            tws_service.subscribe(symbols)
         
-        try:
-            from tbot.brokers.ibkr_client import IBKRClient
-            
-            # 断开旧连接
-            if ibkr_client is not None and ibkr_client.is_connected:
-                ibkr_client.disconnect()
-            
-            ibkr_client = IBKRClient(port=port, client_id=10, timeout=10)
-            result["success"] = ibkr_client.connect_sync()
-        except Exception as e:
-            result["error"] = str(e)
-            result["success"] = False
-    
-    try:
-        thread = threading.Thread(target=do_connect)
-        thread.start()
-        thread.join(timeout=15)
-        
-        if thread.is_alive():
-            return {
-                "success": False,
-                "message": "连接超时",
-                "data_source": "yahoo"
-            }
-        
-        if result["success"]:
-            current_data_source = "tws"
-            return {
-                "success": True,
-                "message": f"成功连接到 TWS (端口 {port})",
-                "data_source": "tws"
-            }
-        else:
-            return {
-                "success": False,
-                "message": result["error"] or "无法连接到 TWS，请确保 TWS 已启动并启用 API",
-                "data_source": "yahoo"
-            }
-    except Exception as e:
-        logger.error(f"连接 TWS 失败: {e}")
+        return {
+            "success": True,
+            "message": f"成功连接到 TWS (端口 {port})",
+            "data_source": "tws"
+        }
+    else:
         return {
             "success": False,
-            "message": f"连接错误: {str(e)}",
+            "message": tws_service.error or "无法连接到 TWS，请确保 TWS 已启动并启用 API",
             "data_source": "yahoo"
         }
 
@@ -349,6 +312,11 @@ async def add_to_watchlist(request: SymbolRequest):
         raise HTTPException(status_code=400, detail="Symbol too long")
     
     watchlist_manager.add(symbol)
+    
+    # 如果 TWS 服务运行中，订阅新股票
+    if tws_service is not None and tws_service.is_connected:
+        tws_service.subscribe([symbol])
+    
     logger.info(f"添加到 Watchlist: {symbol}")
     
     return WatchlistResponse(symbols=watchlist_manager.get_all())
@@ -362,6 +330,11 @@ async def remove_from_watchlist(symbol: str):
     
     symbol = symbol.upper().strip()
     watchlist_manager.remove(symbol)
+    
+    # 如果 TWS 服务运行中，取消订阅
+    if tws_service is not None and tws_service.is_connected:
+        tws_service.unsubscribe([symbol])
+    
     logger.info(f"从 Watchlist 移除: {symbol}")
     
     return WatchlistResponse(symbols=watchlist_manager.get_all())
@@ -486,16 +459,17 @@ async def get_dashboard():
     # Watchlist
     symbols = watchlist_manager.get_all()
     
-    # 统一使用 Yahoo Finance 获取数据（稳定可靠）
-    # TWS 模式只表示已建立 TWS 连接，但实际数据仍来自 Yahoo
-    tasks = [get_yahoo_stock_status(symbol) for symbol in symbols]
-    stocks = await asyncio.gather(*tasks)
-    
-    # 确定数据源标识
-    if current_data_source == "tws" and ibkr_client is not None and ibkr_client.is_connected:
-        actual_source = "tws"  # 已连接 TWS（数据来自 Yahoo）
+    # 根据数据源获取股票数据
+    if current_data_source == "tws" and tws_service is not None and tws_service.is_connected:
+        # 使用 TWS 实时数据
+        tasks = [get_tws_stock_status(symbol) for symbol in symbols]
+        actual_source = "tws"
     else:
+        # 使用 Yahoo Finance 数据
+        tasks = [get_yahoo_stock_status(symbol) for symbol in symbols]
         actual_source = "yahoo"
+    
+    stocks = await asyncio.gather(*tasks)
     
     return DashboardResponse(
         market_status=market_status,
@@ -561,19 +535,37 @@ async def fetch_yahoo_quote(symbol: str) -> dict[str, Any] | None:
             price = meta.get("regularMarketPrice")
             prev_close = meta.get("previousClose") or meta.get("chartPreviousClose")
             
-            # 获取日内 OHLCV
+            # 获取日内 OHLCV - 使用 meta 中的全天数据
             indicators = quote.get("indicators", {})
             quotes = indicators.get("quote", [{}])[0]
+            
+            # 全天高低点从 meta 获取（更准确）
+            day_high = meta.get("regularMarketDayHigh")
+            day_low = meta.get("regularMarketDayLow")
+            day_open = meta.get("regularMarketOpen")
+            
+            # 如果 meta 中没有开盘价，从第一个1分钟K线获取
+            if day_open is None and quotes.get("open"):
+                opens = quotes.get("open", [])
+                # 找第一个非 None 的开盘价
+                for o in opens:
+                    if o is not None:
+                        day_open = o
+                        break
+            
+            # 计算总成交量（所有1分钟K线成交量之和）
+            volumes = quotes.get("volume", [])
+            total_volume = sum(v for v in volumes if v is not None) if volumes else None
             
             return {
                 "symbol": symbol,
                 "name": meta.get("shortName") or meta.get("longName") or symbol,
                 "price": price,
                 "prev_close": prev_close,
-                "open": quotes.get("open", [None])[-1] if quotes.get("open") else None,
-                "high": quotes.get("high", [None])[-1] if quotes.get("high") else None,
-                "low": quotes.get("low", [None])[-1] if quotes.get("low") else None,
-                "volume": quotes.get("volume", [None])[-1] if quotes.get("volume") else None,
+                "open": day_open,
+                "high": day_high,
+                "low": day_low,
+                "volume": total_volume,
                 "currency": meta.get("currency", "USD"),
                 "exchange": meta.get("exchangeName"),
             }
@@ -583,11 +575,175 @@ async def fetch_yahoo_quote(symbol: str) -> dict[str, Any] | None:
         return None
 
 
-async def get_yahoo_stock_status(symbol: str) -> StockStatus:
-    """获取股票状态（使用 Yahoo Finance）"""
+async def fetch_yahoo_ma20(symbol: str) -> float | None:
+    """
+    从 Yahoo Finance 获取 20 日均线
     
-    # 尝试获取真实数据
-    quote = await fetch_yahoo_quote(symbol)
+    使用日线数据计算 MA20
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {
+        "interval": "1d",
+        "range": "1mo",  # 获取1个月数据计算 MA20
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=YAHOO_HEADERS) as client:
+            response = await client.get(url, params=params)
+            
+            if response.status_code != 200:
+                return None
+            
+            data = response.json()
+            result = data.get("chart", {}).get("result", [])
+            
+            if not result:
+                return None
+            
+            quotes = result[0].get("indicators", {}).get("quote", [{}])[0]
+            closes = quotes.get("close", [])
+            
+            # 过滤 None 值
+            valid_closes = [c for c in closes if c is not None]
+            
+            if len(valid_closes) >= 20:
+                ma20 = sum(valid_closes[-20:]) / 20
+                return round(ma20, 2)
+            elif len(valid_closes) > 0:
+                # 不足20天，使用可用数据
+                ma20 = sum(valid_closes) / len(valid_closes)
+                return round(ma20, 2)
+            
+            return None
+            
+    except Exception as e:
+        logger.error(f"获取 {symbol} MA20 失败: {e}")
+        return None
+
+
+async def fetch_yahoo_sparkline(symbol: str, points: int = 30) -> list[float]:
+    """
+    从 Yahoo Finance 获取价格序列用于 Sparkline
+    
+    - 交易日：获取今日 5 分钟 K 线
+    - 休市日（周末/节假日）：获取上一个交易日的数据
+    
+    Args:
+        symbol: 股票代码
+        points: 返回的数据点数 (默认 30 个点)
+    
+    Returns:
+        简化后的价格序列
+    """
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    
+    # 先尝试获取 1d 数据
+    params = {
+        "interval": "5m",
+        "range": "1d",
+        "includePrePost": "false",
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0, headers=YAHOO_HEADERS) as client:
+            response = await client.get(url, params=params)
+            
+            if response.status_code != 200:
+                return []
+            
+            data = response.json()
+            result = data.get("chart", {}).get("result", [])
+            
+            if not result:
+                return []
+            
+            quotes = result[0].get("indicators", {}).get("quote", [{}])[0]
+            closes = quotes.get("close", [])
+            timestamps = result[0].get("timestamp", [])
+            
+            # 过滤 None 值
+            valid_closes = [c for c in closes if c is not None]
+            
+            # 如果数据点太少（休市或盘前），获取更多天数的数据
+            if len(valid_closes) < 5:
+                # 获取最近 5 天的数据，提取最后一个完整交易日
+                params["range"] = "5d"
+                response = await client.get(url, params=params)
+                
+                if response.status_code != 200:
+                    return []
+                
+                data = response.json()
+                result = data.get("chart", {}).get("result", [])
+                
+                if not result:
+                    return []
+                
+                quotes = result[0].get("indicators", {}).get("quote", [{}])[0]
+                closes = quotes.get("close", [])
+                timestamps = result[0].get("timestamp", [])
+                
+                if not timestamps or not closes:
+                    return []
+                
+                # 按日期分组，找到最后一个完整交易日
+                from datetime import datetime
+                
+                day_data: dict[str, list[float]] = {}
+                for ts, close in zip(timestamps, closes):
+                    if ts and close is not None:
+                        # 转换为美东时间的日期
+                        dt = datetime.fromtimestamp(ts)
+                        day_key = dt.strftime("%Y-%m-%d")
+                        if day_key not in day_data:
+                            day_data[day_key] = []
+                        day_data[day_key].append(close)
+                
+                # 取数据点最多的那一天（通常是最后一个完整交易日）
+                if day_data:
+                    # 按日期排序，取最后一天有足够数据的
+                    sorted_days = sorted(day_data.keys(), reverse=True)
+                    for day in sorted_days:
+                        if len(day_data[day]) >= 5:  # 至少要有5个数据点
+                            valid_closes = day_data[day]
+                            break
+                    else:
+                        # 如果没有足够数据，取最后一天的所有数据
+                        valid_closes = day_data[sorted_days[0]] if sorted_days else []
+            
+            if not valid_closes:
+                return []
+            
+            # 简化数据点：如果数据过多，采样到指定点数
+            if len(valid_closes) > points:
+                step = len(valid_closes) / points
+                sampled = [valid_closes[int(i * step)] for i in range(points)]
+                return [round(p, 2) for p in sampled]
+            
+            return [round(p, 2) for p in valid_closes]
+            
+    except Exception as e:
+        logger.error(f"获取 {symbol} Sparkline 失败: {e}")
+        return []
+
+
+async def get_yahoo_stock_status(symbol: str) -> StockStatus:
+    """获取股票状态（使用 Yahoo Finance + 新闻检测）"""
+    
+    # 并行获取报价、新闻、MA20 和 Sparkline
+    quote_task = fetch_yahoo_quote(symbol)
+    ma20_task = fetch_yahoo_ma20(symbol)
+    sparkline_task = fetch_yahoo_sparkline(symbol)
+    news_task = news_detector.detect(symbol) if news_detector else None
+    
+    quote = await quote_task
+    ma20 = await ma20_task
+    sparkline = await sparkline_task
+    news_result = await news_task if news_task else None
+    
+    # 新闻事件信息
+    news_score = news_result.event_score if news_result else 0.0
+    news_keywords = news_result.detected_keywords if news_result else []
     
     if quote and quote.get("price"):
         price = quote["price"]
@@ -599,28 +755,44 @@ async def get_yahoo_stock_status(symbol: str) -> StockStatus:
         # 简单计算 VWAP (使用 typical price 近似)
         vwap = (high + low + price) / 3 if high and low else price
         
-        # OR 使用开盘价附近
-        or_range = abs(high - low) * 0.3 if high and low else price * 0.01
+        # OR 使用开盘价附近范围
+        or_range = abs(high - low) * 0.3 if high != low else price * 0.01
         or15_high = open_price + or_range
         or15_low = open_price - or_range
         
         vwap_diff_pct = (price - vwap) / vwap * 100 if vwap else 0
         
-        # 基于价格走势判断日类型
+        # 计算缺口
+        gap_pct = (open_price - prev_close) / prev_close if prev_close else 0
+        
+        # 基于价格走势和新闻判断日类型
         day_change = (price - prev_close) / prev_close if prev_close else 0
         
-        if abs(day_change) > 0.02:  # 波动超过 2%
+        # 事件日判断 (新闻得分高 或 大缺口)
+        if news_score >= 0.6 or abs(gap_pct) >= 0.015:
+            regime = "event"
+            reasons = []
+            if news_keywords:
+                reasons.append(f"新闻事件: {', '.join(news_keywords[:3])}")
+            if abs(gap_pct) >= 0.015:
+                reasons.append(f"跳空缺口 {gap_pct:.2%}")
+            if day_change > 0:
+                reasons.append(f"日涨幅 {day_change:.2%}")
+            else:
+                reasons.append(f"日跌幅 {day_change:.2%}")
+            confidence = max(news_score, 0.7)
+        elif abs(day_change) > 0.02:  # 波动超过 2%
             if day_change > 0:
                 regime = "trend_up"
                 reasons = [
                     f"日涨幅 {day_change:.2%}",
-                    f"当前价格 ${price:.2f} 高于开盘价 ${open_price:.2f}" if price > open_price else f"价格在高位震荡",
+                    f"当前价格 ${price:.2f} 高于开盘价 ${open_price:.2f}" if price > open_price else "价格在高位震荡",
                 ]
             else:
                 regime = "trend_down"
                 reasons = [
                     f"日跌幅 {day_change:.2%}",
-                    f"当前价格 ${price:.2f} 低于开盘价 ${open_price:.2f}" if price < open_price else f"价格在低位震荡",
+                    f"当前价格 ${price:.2f} 低于开盘价 ${open_price:.2f}" if price < open_price else "价格在低位震荡",
                 ]
             confidence = min(0.7 + abs(day_change) * 5, 0.95)
         else:
@@ -636,6 +808,11 @@ async def get_yahoo_stock_status(symbol: str) -> StockStatus:
             name=quote.get("name") or symbol,
             exchange=quote.get("exchange"),
             price=round(price, 2),
+            prev_close=round(prev_close, 2) if prev_close else None,
+            day_high=round(high, 2) if high else None,
+            day_low=round(low, 2) if low else None,
+            day_open=round(open_price, 2) if open_price else None,
+            ma20=ma20,
             vwap=round(vwap, 2),
             vwap_diff_pct=round(vwap_diff_pct, 2),
             above_vwap=price > vwap,
@@ -647,6 +824,9 @@ async def get_yahoo_stock_status(symbol: str) -> StockStatus:
             regime=regime,
             regime_confidence=round(confidence, 2),
             regime_reasons=reasons,
+            news_event_score=round(news_score, 2),
+            news_keywords=news_keywords,
+            sparkline=sparkline,
             updated_at=get_et_now().strftime("%H:%M:%S"),
         )
     
@@ -656,6 +836,11 @@ async def get_yahoo_stock_status(symbol: str) -> StockStatus:
         name=symbol,
         exchange=None,
         price=0.0,
+        prev_close=None,
+        day_high=None,
+        day_low=None,
+        day_open=None,
+        ma20=None,
         vwap=0.0,
         vwap_diff_pct=0.0,
         above_vwap=False,
@@ -671,14 +856,119 @@ async def get_yahoo_stock_status(symbol: str) -> StockStatus:
     )
 
 
-# ============== 简化版 TWS 模式 ==============
-# 说明：由于 ib_insync 的事件循环限制，TWS 数据获取在 FastAPI 异步环境中无法正常工作
-# 当前策略：TWS 模式仅表示已建立 TWS 连接，实际股票数据统一来自 Yahoo Finance
-# 未来计划：Phase B 将实现独立的 TWSDataService 后台服务
+# ============== TWS 数据服务模式 ==============
+# 说明：TWSDataService 在后台线程中运行 ib_insync，提供实时行情数据
+# 当 TWS 连接可用时，从缓存读取实时数据；否则回退到 Yahoo Finance
+
+
+async def get_tws_stock_status(symbol: str) -> StockStatus:
+    """从 TWSDataService 获取实时股票状态"""
+    global tws_service, news_detector
+    
+    if not tws_service or not tws_service.is_connected:
+        # TWS 未连接，回退到 Yahoo
+        return await get_yahoo_stock_status(symbol)
+    
+    # 从缓存获取 TWS 数据
+    stock_data = tws_service.get_stock_data(symbol)
+    
+    if not stock_data or stock_data.price <= 0:
+        # 没有 TWS 数据，回退到 Yahoo
+        return await get_yahoo_stock_status(symbol)
+    
+    # 使用 TWS 的实时数据
+    price = stock_data.price
+    vwap = stock_data.vwap if stock_data.vwap > 0 else price
+    high = stock_data.high if stock_data.high > 0 else price
+    low = stock_data.low if stock_data.low > 0 else price
+    open_price = stock_data.open if stock_data.open > 0 else price
+    prev_close = stock_data.close if stock_data.close > 0 else price
+    
+    # 获取新闻事件信息和 MA20（TWS 不提供 MA20，从 Yahoo 获取）
+    news_task = news_detector.detect(symbol) if news_detector else None
+    ma20_task = fetch_yahoo_ma20(symbol)
+    
+    news_result = await news_task if news_task else None
+    ma20 = await ma20_task
+    
+    news_score = news_result.event_score if news_result else 0.0
+    news_keywords = news_result.detected_keywords if news_result else []
+    
+    vwap_diff_pct = (price - vwap) / vwap * 100 if vwap > 0 else 0
+    
+    # OR 计算 (使用当日高低范围的 30%)
+    or_range = abs(high - low) * 0.3 if high > low else price * 0.01
+    or15_high = open_price + or_range
+    or15_low = open_price - or_range
+    
+    # 计算缺口
+    gap_pct = (open_price - prev_close) / prev_close if prev_close > 0 else 0
+    day_change = (price - prev_close) / prev_close if prev_close > 0 else 0
+    
+    # 事件日判断
+    if news_score >= 0.6 or abs(gap_pct) >= 0.015:
+        regime = "event"
+        reasons = []
+        if news_keywords:
+            reasons.append(f"新闻事件: {', '.join(news_keywords[:3])}")
+        if abs(gap_pct) >= 0.015:
+            reasons.append(f"跳空缺口 {gap_pct:.2%}")
+        reasons.append(f"日涨幅 {day_change:.2%}" if day_change > 0 else f"日跌幅 {day_change:.2%}")
+        confidence = max(news_score, 0.7)
+    elif abs(day_change) > 0.02:
+        if day_change > 0:
+            regime = "trend_up"
+            reasons = [f"日涨幅 {day_change:.2%}", f"价格高于VWAP {vwap_diff_pct:.2f}%" if vwap_diff_pct > 0 else "价格在高位震荡"]
+        else:
+            regime = "trend_down"
+            reasons = [f"日跌幅 {day_change:.2%}", f"价格低于VWAP {vwap_diff_pct:.2f}%" if vwap_diff_pct < 0 else "价格在低位震荡"]
+        confidence = min(0.7 + abs(day_change) * 5, 0.95)
+    else:
+        regime = "range"
+        reasons = [f"日波动 {day_change:.2%} 较小", "价格在区间内震荡"]
+        confidence = 0.6
+    
+    return StockStatus(
+        symbol=symbol,
+        name=symbol,  # TWS 不提供公司名称
+        exchange="SMART",
+        price=round(price, 2),
+        prev_close=round(prev_close, 2),
+        day_high=round(high, 2),
+        day_low=round(low, 2),
+        day_open=round(open_price, 2),
+        ma20=ma20,
+        vwap=round(vwap, 2),
+        vwap_diff_pct=round(vwap_diff_pct, 2),
+        above_vwap=price > vwap,
+        or5_high=round(or15_high, 2),
+        or5_low=round(or15_low, 2),
+        or15_high=round(or15_high, 2),
+        or15_low=round(or15_low, 2),
+        or15_complete=True,
+        regime=regime,
+        regime_confidence=round(confidence, 2),
+        regime_reasons=reasons,
+        news_event_score=round(news_score, 2),
+        news_keywords=news_keywords,
+        updated_at=get_et_now().strftime("%H:%M:%S"),
+    )
 
 
 async def get_real_stock_status(symbol: str) -> StockStatus:
-    """获取真实股票状态（统一使用 Yahoo Finance）"""
+    """获取股票状态 - 自动选择数据源
+    
+    优先级：
+    1. TWS 连接可用且有数据 -> 使用 TWS 实时数据
+    2. 否则 -> 使用 Yahoo Finance
+    """
+    global tws_service
+    
+    # 如果 TWS 服务可用且已连接，使用 TWS 数据
+    if tws_service and tws_service.is_connected:
+        return await get_tws_stock_status(symbol)
+    
+    # 默认使用 Yahoo Finance
     return await get_yahoo_stock_status(symbol)
 
 

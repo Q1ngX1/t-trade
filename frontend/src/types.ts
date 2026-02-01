@@ -13,6 +13,11 @@ export interface StockStatus {
   name: string;  // 股票名称
   exchange: string | null;  // 交易所
   price: number;
+  prev_close: number | null;  // 昨收
+  day_high: number | null;  // 当日最高
+  day_low: number | null;  // 当日最低
+  day_open: number | null;  // 当日开盘
+  ma20: number | null;  // 20日均线
   vwap: number;
   vwap_diff_pct: number;
   above_vwap: boolean;
@@ -24,6 +29,9 @@ export interface StockStatus {
   regime: string;
   regime_confidence: number;
   regime_reasons: string[];
+  news_event_score: number;  // 新闻事件得分
+  news_keywords: string[];  // 新闻关键词
+  sparkline: number[];  // 今日价格走势
   updated_at: string;
 }
 

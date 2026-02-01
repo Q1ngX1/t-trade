@@ -1,16 +1,54 @@
 # 交易参数配置
 
-# Opening Range 设置
+# ============== 仓位配置 ==============
+position:
+  core_shares: 100 # 底仓股数（不动）
+  t_max_shares: 50 # 机动仓最大股数（用于做T）
+  t_step_shares: 25 # 每次T操作股数（<= t_max_shares）
+
+# ============== 风控参数 ==============
+risk:
+  max_round_trips_per_day: 2 # 每日最多回合数
+  daily_loss_limit: 100.0 # 日内最大亏损金额（到达即停止）
+  cooldown_minutes: 15 # 交易冷却时间（分钟）
+  open_buffer_minutes: 30 # 开盘禁做时间（分钟）
+  event_open_buffer_minutes: 60 # 事件日开盘禁做时间（分钟）
+  max_daily_loss_r: 2.0 # 日内最大亏损 R
+  max_trades_per_day: 2 # 每日最多交易次数
+  max_position_pct: 0.04 # 单笔最大仓位 (4%)
+
+# ============== 交易阈值 ==============
+thresholds:
+  # 震荡日（CHOP/RANGE）阈值
+  chop:
+    buy_threshold: -1.0 # 低于 VWAP N 个标准差时买入
+    sell_threshold: 1.0 # 高于 VWAP N 个标准差时卖出
+    or_band_pct: 0.002 # OR 边界判定带宽 (0.2%)
+    breakout_hold_bars: 5 # 突破持续确认 bar 数
+
+  # 趋势日阈值
+  trend:
+    pullback_threshold: -0.5 # 回调买入阈值（标准差）
+    extension_threshold: 1.5 # 延伸卖出阈值（标准差）
+    support_buffer_pct: 0.003 # 关键支撑缓冲 (0.3%)
+
+  # 事件日阈值（更宽）
+  event:
+    buy_threshold: -1.5 # 更大偏离才买
+    sell_threshold: 1.5 # 更大偏离才卖
+    size_multiplier: 0.5 # 仓位缩小到50%
+
+# ============== Opening Range 设置 ==============
 opening_range:
   or5_minutes: 5 # OR5 窗口（分钟）
   or15_minutes: 15 # OR15 窗口（分钟）
 
-# VWAP 参数
+# ============== VWAP 参数 ==============
 vwap:
   band_pct: 0.002 # VWAP band 宽度 (0.2%)
   atr_band_multiplier: 0.5 # ATR 倍数作为 band
 
-# 日类型分类阈值
+# ============== 日类型分类阈值 ==============
 regime:
   # 趋势日判定
   trend:
@@ -29,7 +67,7 @@ regime:
     early_volume_ratio: 2.0 # 开盘30分钟成交量是平时2倍以上
     gap_pct: 0.015 # 缺口超过1.5%
 
-# 交易时间窗口 (ET时区)
+# ============== 交易时间窗口 (ET时区) ==============
 trading_windows:
   market_open: "09:30"
   market_close: "16:00"
@@ -48,18 +86,16 @@ trading_windows:
   # 收盘前禁止新开仓
   close_only_start: "15:45"
 
-# 风控参数
-risk:
-  max_daily_loss_r: 2.0 # 日内最大亏损 R
-  max_trades_per_day: 2 # 每日最多交易次数
-  max_position_pct: 0.04 # 单笔最大仓位 (4%)
-  cooldown_minutes: 15 # 止损后冷静期（分钟）
+# ============== 流动性检查 ==============
+liquidity:
+  max_spread_pct: 0.005 # 最大价差 (0.5%)
+  min_depth: 100 # 最小订单簿深度
 
-# 移动平均
+# ============== 移动平均 ==============
 ma:
   daily_ma_period: 20 # 日线MA周期
 
-# ATR 计算
+# ============== ATR 计算 ==============
 atr:
   period: 14 # ATR周期（日线）
   intraday_period: 20 # 日内ATR周期（1m bars）

@@ -12,10 +12,232 @@ import {
   XCircle,
   Database,
   Wifi,
-  WifiOff
+  WifiOff,
+  Globe,
+  Calendar
 } from 'lucide-react';
 import { DashboardData, StockStatus, DataSourceStatus } from './types';
 import { fetchDashboard, addToWatchlistWithValidation, removeFromWatchlist, getDataSource, setDataSource } from './api';
+
+// ============== 时区类型 ==============
+
+type TimezoneOption = 'ET' | 'LOCAL' | 'UTC';
+
+const TIMEZONE_LABELS: Record<TimezoneOption, string> = {
+  'ET': '美东时间',
+  'LOCAL': '本地时间',
+  'UTC': 'UTC',
+};
+
+/**
+ * 将美东时间字符串转换为指定时区
+ * @param etTimeStr 格式如 "2026-02-01 10:30:00 ET" 或 "10:30:00"
+ * @param targetTz 目标时区
+ * @returns 转换后的时间字符串
+ */
+function convertTimezone(etTimeStr: string, targetTz: TimezoneOption): string {
+  if (targetTz === 'ET') return etTimeStr;
+  
+  try {
+    // 解析 ET 时间
+    let dateStr: string;
+    let timeStr: string;
+    
+    if (etTimeStr.includes(' ET')) {
+      // 格式: "2026-02-01 10:30:00 ET"
+      const cleaned = etTimeStr.replace(' ET', '');
+      const parts = cleaned.split(' ');
+      dateStr = parts[0];
+      timeStr = parts[1];
+    } else if (etTimeStr.match(/^\d{2}:\d{2}:\d{2}$/)) {
+      // 格式: "10:30:00" (只有时间)
+      const today = new Date();
+      dateStr = today.toISOString().split('T')[0];
+      timeStr = etTimeStr;
+    } else {
+      return etTimeStr;
+    }
+    
+    // 创建 ET 时间的 Date 对象
+    // 美东时间 (EST: UTC-5, EDT: UTC-4)
+    // 简化处理：假设使用 EST (UTC-5)
+    const etDate = new Date(`${dateStr}T${timeStr}-05:00`);
+    
+    if (isNaN(etDate.getTime())) return etTimeStr;
+    
+    if (targetTz === 'UTC') {
+      const hours = etDate.getUTCHours().toString().padStart(2, '0');
+      const mins = etDate.getUTCMinutes().toString().padStart(2, '0');
+      const secs = etDate.getUTCSeconds().toString().padStart(2, '0');
+      return `${dateStr} ${hours}:${mins}:${secs} UTC`;
+    } else if (targetTz === 'LOCAL') {
+      const hours = etDate.getHours().toString().padStart(2, '0');
+      const mins = etDate.getMinutes().toString().padStart(2, '0');
+      const secs = etDate.getSeconds().toString().padStart(2, '0');
+      // 获取本地时区偏移
+      const offset = -etDate.getTimezoneOffset();
+      const offsetHours = Math.floor(Math.abs(offset) / 60);
+      const offsetSign = offset >= 0 ? '+' : '-';
+      const tzName = `GMT${offsetSign}${offsetHours}`;
+      return `${dateStr} ${hours}:${mins}:${secs} ${tzName}`;
+    }
+  } catch {
+    return etTimeStr;
+  }
+  
+  return etTimeStr;
+}
+
+// ============== 市场休市检测 ==============
+
+// 美股节假日 (按年份配置)
+const US_MARKET_HOLIDAYS: Record<number, { date: string; name: string }[]> = {
+  2025: [
+    { date: '2025-01-01', name: '元旦' },
+    { date: '2025-01-20', name: '马丁·路德·金纪念日' },
+    { date: '2025-02-17', name: '总统日' },
+    { date: '2025-04-18', name: '耶稣受难日' },
+    { date: '2025-05-26', name: '阵亡将士纪念日' },
+    { date: '2025-06-19', name: '六月节' },
+    { date: '2025-07-04', name: '独立日' },
+    { date: '2025-09-01', name: '劳动节' },
+    { date: '2025-11-27', name: '感恩节' },
+    { date: '2025-12-25', name: '圣诞节' },
+  ],
+  2026: [
+    { date: '2026-01-01', name: '元旦' },
+    { date: '2026-01-19', name: '马丁·路德·金纪念日' },
+    { date: '2026-02-16', name: '总统日' },
+    { date: '2026-04-03', name: '耶稣受难日' },
+    { date: '2026-05-25', name: '阵亡将士纪念日' },
+    { date: '2026-06-19', name: '六月节' },
+    { date: '2026-07-03', name: '独立日(观察日)' },
+    { date: '2026-09-07', name: '劳动节' },
+    { date: '2026-11-26', name: '感恩节' },
+    { date: '2026-12-25', name: '圣诞节' },
+  ],
+  2027: [
+    { date: '2027-01-01', name: '元旦' },
+    { date: '2027-01-18', name: '马丁·路德·金纪念日' },
+    { date: '2027-02-15', name: '总统日' },
+    { date: '2027-03-26', name: '耶稣受难日' },
+    { date: '2027-05-31', name: '阵亡将士纪念日' },
+    { date: '2027-06-18', name: '六月节(观察日)' },
+    { date: '2027-07-05', name: '独立日(观察日)' },
+    { date: '2027-09-06', name: '劳动节' },
+    { date: '2027-11-25', name: '感恩节' },
+    { date: '2027-12-24', name: '圣诞节(观察日)' },
+  ],
+};
+
+interface MarketClosedInfo {
+  isClosed: boolean;
+  reason: string;
+  type: 'weekend' | 'holiday' | 'none';
+  nextOpenDate?: string;
+}
+
+/**
+ * 检测市场是否因周末或节假日休市
+ */
+function checkMarketClosed(etTimeStr: string): MarketClosedInfo {
+  try {
+    // 解析 ET 时间
+    let dateStr: string;
+    
+    if (etTimeStr.includes(' ET')) {
+      dateStr = etTimeStr.replace(' ET', '').split(' ')[0];
+    } else {
+      // 使用当前日期
+      const now = new Date();
+      dateStr = now.toISOString().split('T')[0];
+    }
+    
+    const date = new Date(dateStr + 'T12:00:00');
+    const dayOfWeek = date.getDay(); // 0 = Sunday, 6 = Saturday
+    const year = date.getFullYear();
+    
+    // 检查周末
+    if (dayOfWeek === 0) {
+      return {
+        isClosed: true,
+        reason: '周日休市',
+        type: 'weekend',
+        nextOpenDate: getNextTradingDay(dateStr),
+      };
+    }
+    if (dayOfWeek === 6) {
+      return {
+        isClosed: true,
+        reason: '周六休市',
+        type: 'weekend',
+        nextOpenDate: getNextTradingDay(dateStr),
+      };
+    }
+    
+    // 检查节假日
+    const holidays = US_MARKET_HOLIDAYS[year] || [];
+    const holiday = holidays.find(h => h.date === dateStr);
+    if (holiday) {
+      return {
+        isClosed: true,
+        reason: `${holiday.name} - 休市`,
+        type: 'holiday',
+        nextOpenDate: getNextTradingDay(dateStr),
+      };
+    }
+    
+    return { isClosed: false, reason: '', type: 'none' };
+  } catch {
+    return { isClosed: false, reason: '', type: 'none' };
+  }
+}
+
+/**
+ * 获取下一个交易日
+ */
+function getNextTradingDay(dateStr: string): string {
+  const date = new Date(dateStr + 'T12:00:00');
+  const year = date.getFullYear();
+  const holidays = US_MARKET_HOLIDAYS[year] || [];
+  const holidayDates = new Set(holidays.map(h => h.date));
+  
+  // 最多查找 10 天
+  for (let i = 1; i <= 10; i++) {
+    const nextDate = new Date(date);
+    nextDate.setDate(nextDate.getDate() + i);
+    const nextDateStr = nextDate.toISOString().split('T')[0];
+    const nextDayOfWeek = nextDate.getDay();
+    
+    // 跳过周末
+    if (nextDayOfWeek === 0 || nextDayOfWeek === 6) continue;
+    
+    // 检查下一年的节假日
+    const nextYear = nextDate.getFullYear();
+    const nextYearHolidays = US_MARKET_HOLIDAYS[nextYear] || [];
+    const nextHolidayDates = new Set(nextYearHolidays.map(h => h.date));
+    
+    // 跳过节假日
+    if (holidayDates.has(nextDateStr) || nextHolidayDates.has(nextDateStr)) continue;
+    
+    return nextDateStr;
+  }
+  
+  return '';
+}
+
+/**
+ * 格式化日期为友好显示
+ */
+function formatDateFriendly(dateStr: string): string {
+  if (!dateStr) return '';
+  const date = new Date(dateStr + 'T12:00:00');
+  const weekdays = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  const weekday = weekdays[date.getDay()];
+  return `${month}月${day}日 (${weekday})`;
+}
 
 // ============== 辅助函数 ==============
 
@@ -72,26 +294,154 @@ function getSessionLabel(session: string) {
 
 // ============== 组件 ==============
 
+/**
+ * 获取交易时间（根据时区转换）
+ */
+function getMarketHours(timezone: TimezoneOption): { 
+  premarket: string; 
+  open: string; 
+  close: string; 
+  afterhours: string;
+} {
+  // 美股固定时间 (ET)
+  const hours = {
+    premarket: '04:00',
+    open: '09:30',
+    close: '16:00',
+    afterhours: '20:00',
+  };
+  
+  if (timezone === 'ET') {
+    return {
+      premarket: `${hours.premarket} ET`,
+      open: `${hours.open} ET`,
+      close: `${hours.close} ET`,
+      afterhours: `${hours.afterhours} ET`,
+    };
+  }
+  
+  // 转换时间
+  const today = new Date().toISOString().split('T')[0];
+  const convertTime = (time: string) => {
+    const result = convertTimezone(`${today} ${time}:00 ET`, timezone);
+    // 只提取时间部分
+    const match = result.match(/(\d{2}:\d{2})/);
+    if (match) {
+      const suffix = timezone === 'UTC' ? ' UTC' : '';
+      return match[1] + suffix;
+    }
+    return time;
+  };
+  
+  return {
+    premarket: convertTime(hours.premarket),
+    open: convertTime(hours.open),
+    close: convertTime(hours.close),
+    afterhours: convertTime(hours.afterhours),
+  };
+}
+
+/**
+ * 获取时段对应的时间范围
+ */
+function getSessionTimeRange(session: string, timezone: TimezoneOption): string {
+  const hours = getMarketHours(timezone);
+  
+  const ranges: Record<string, string> = {
+    'premarket': `${hours.premarket} - ${hours.open}`,
+    'opening': `${hours.open} - 开盘后30分钟`,
+    'morning': `${hours.open} - 12:00`,
+    'midday': '12:00 - 13:00',
+    'afternoon': `13:00 - ${hours.close}`,
+    'close_only': `收盘前15分钟 - ${hours.close}`,
+    'afterhours': `${hours.close} - ${hours.afterhours}`,
+    'closed': '休市',
+  };
+  
+  return ranges[session] || '';
+}
+
 function MarketStatusCard({ 
   session, 
   progress, 
   tradingAllowed, 
   tradingReason, 
-  currentTime 
+  currentTime,
+  timezone,
 }: { 
   session: string;
   progress: number;
   tradingAllowed: boolean;
   tradingReason: string;
   currentTime: string;
+  timezone: TimezoneOption;
 }) {
+  const displayTime = convertTimezone(currentTime, timezone);
+  const marketHours = getMarketHours(timezone);
+  const sessionTimeRange = getSessionTimeRange(session, timezone);
+  const closedInfo = checkMarketClosed(currentTime);
+  
+  // 如果是周末或节假日休市，显示特殊界面
+  if (closedInfo.isClosed) {
+    return (
+      <div className="bg-white rounded-lg shadow-md p-6 mb-6">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold text-gray-800">市场状态</h2>
+          <div className="flex items-center text-gray-500 text-sm">
+            <Clock className="w-4 h-4 mr-1" />
+            {displayTime}
+          </div>
+        </div>
+        
+        <div className="bg-gray-100 rounded-lg p-6 text-center">
+          <div className="flex justify-center mb-3">
+            {closedInfo.type === 'weekend' ? (
+              <Calendar className="w-12 h-12 text-gray-400" />
+            ) : (
+              <AlertTriangle className="w-12 h-12 text-orange-400" />
+            )}
+          </div>
+          <div className="text-xl font-semibold text-gray-700 mb-2">
+            {closedInfo.reason}
+          </div>
+          {closedInfo.nextOpenDate && (
+            <div className="text-sm text-gray-500">
+              下一交易日: <span className="font-medium text-blue-600">{formatDateFriendly(closedInfo.nextOpenDate)}</span>
+              <span className="ml-2">({marketHours.open} 开盘)</span>
+            </div>
+          )}
+        </div>
+        
+        <div className="mt-4 grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-gray-500">
+          <div className="bg-gray-50 rounded p-2 text-center">
+            <div className="font-medium">盘前交易</div>
+            <div>{marketHours.premarket}</div>
+          </div>
+          <div className="bg-gray-50 rounded p-2 text-center">
+            <div className="font-medium">开盘</div>
+            <div>{marketHours.open}</div>
+          </div>
+          <div className="bg-gray-50 rounded p-2 text-center">
+            <div className="font-medium">收盘</div>
+            <div>{marketHours.close}</div>
+          </div>
+          <div className="bg-gray-50 rounded p-2 text-center">
+            <div className="font-medium">盘后交易</div>
+            <div>至 {marketHours.afterhours}</div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+  
+  // 正常交易日界面
   return (
     <div className="bg-white rounded-lg shadow-md p-6 mb-6">
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold text-gray-800">市场状态</h2>
         <div className="flex items-center text-gray-500 text-sm">
           <Clock className="w-4 h-4 mr-1" />
-          {currentTime}
+          {displayTime}
         </div>
       </div>
       
@@ -99,6 +449,9 @@ function MarketStatusCard({
         <div className="bg-gray-50 rounded-lg p-4">
           <div className="text-sm text-gray-500 mb-1">时段</div>
           <div className="text-lg font-medium text-gray-800">{getSessionLabel(session)}</div>
+          {sessionTimeRange && (
+            <div className="text-xs text-gray-400 mt-1">{sessionTimeRange}</div>
+          )}
         </div>
         
         <div className="bg-gray-50 rounded-lg p-4">
@@ -111,6 +464,9 @@ function MarketStatusCard({
               />
             </div>
             <span className="text-sm font-medium text-gray-700">{(progress * 100).toFixed(0)}%</span>
+          </div>
+          <div className="text-xs text-gray-400 mt-1">
+            开盘 {marketHours.open} → 收盘 {marketHours.close}
           </div>
         </div>
         
@@ -127,9 +483,100 @@ function MarketStatusCard({
             </span>
             <span className="text-gray-500 text-sm ml-2">- {tradingReason}</span>
           </div>
+          <div className="text-xs text-gray-400 mt-2 flex gap-4">
+            <span>盘前: {marketHours.premarket}</span>
+            <span>盘后: {marketHours.close} - {marketHours.afterhours}</span>
+          </div>
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * 迷你走势图组件
+ */
+function Sparkline({ 
+  data, 
+  width = 120, 
+  height = 40,
+  color,
+}: { 
+  data: number[];
+  width?: number;
+  height?: number;
+  color?: string;
+}) {
+  if (!data || data.length < 2) {
+    return (
+      <div 
+        className="flex items-center justify-center text-gray-300 text-xs"
+        style={{ width, height }}
+      >
+        暂无数据
+      </div>
+    );
+  }
+  
+  const min = Math.min(...data);
+  const max = Math.max(...data);
+  const range = max - min || 1;
+  
+  // 计算涨跌颜色
+  const isUp = data[data.length - 1] >= data[0];
+  const lineColor = color || (isUp ? '#22c55e' : '#ef4444'); // green-500 / red-500
+  
+  // 生成 SVG path
+  const padding = 2;
+  const chartWidth = width - padding * 2;
+  const chartHeight = height - padding * 2;
+  
+  const points = data.map((value, index) => {
+    const x = padding + (index / (data.length - 1)) * chartWidth;
+    const y = padding + chartHeight - ((value - min) / range) * chartHeight;
+    return `${x},${y}`;
+  });
+  
+  const pathD = `M ${points.join(' L ')}`;
+  
+  // 创建渐变填充区域
+  const areaPoints = [
+    `${padding},${height - padding}`,
+    ...points,
+    `${width - padding},${height - padding}`,
+  ];
+  const areaD = `M ${areaPoints.join(' L ')} Z`;
+  
+  return (
+    <svg width={width} height={height} className="overflow-visible">
+      <defs>
+        <linearGradient id={`gradient-${isUp ? 'up' : 'down'}`} x1="0%" y1="0%" x2="0%" y2="100%">
+          <stop offset="0%" stopColor={lineColor} stopOpacity="0.3" />
+          <stop offset="100%" stopColor={lineColor} stopOpacity="0.05" />
+        </linearGradient>
+      </defs>
+      {/* 填充区域 */}
+      <path
+        d={areaD}
+        fill={`url(#gradient-${isUp ? 'up' : 'down'})`}
+      />
+      {/* 折线 */}
+      <path
+        d={pathD}
+        fill="none"
+        stroke={lineColor}
+        strokeWidth="1.5"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      {/* 当前价格点 */}
+      <circle
+        cx={width - padding}
+        cy={padding + chartHeight - ((data[data.length - 1] - min) / range) * chartHeight}
+        r="2.5"
+        fill={lineColor}
+      />
+    </svg>
   );
 }
 
@@ -236,19 +683,30 @@ function StockCard({
               </span>
             </div>
           </div>
-          <button
-            onClick={() => onRemove(stock.symbol)}
-            className="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded"
-            title="从 Watchlist 移除"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2">
+            {/* 迷你走势图 */}
+            <div className="hidden sm:block">
+              <Sparkline data={stock.sparkline || []} width={100} height={36} />
+            </div>
+            <button
+              onClick={() => onRemove(stock.symbol)}
+              className="p-1 text-gray-400 hover:text-red-500 hover:bg-red-50 rounded"
+              title="从 Watchlist 移除"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
+      </div>
+      
+      {/* 今日走势图 (移动端显示) */}
+      <div className="sm:hidden px-4 py-2 bg-gray-50 border-b border-gray-100 flex justify-center">
+        <Sparkline data={stock.sparkline || []} width={200} height={40} />
       </div>
       
       {/* 价格信息 */}
       <div className="p-4 bg-gray-50">
-        <div className="grid grid-cols-3 gap-4 text-center">
+        <div className="grid grid-cols-4 gap-3 text-center">
           <div>
             <div className="text-2xl font-bold text-gray-800">${stock.price.toFixed(2)}</div>
             <div className="text-xs text-gray-500">当前价格</div>
@@ -262,8 +720,42 @@ function StockCard({
               {stock.vwap_diff_pct > 0 ? '+' : ''}{stock.vwap_diff_pct.toFixed(2)}%
             </div>
             <div className="text-xs text-gray-500">
-              {stock.above_vwap ? 'VWAP 上方 ✅' : 'VWAP 下方 ❌'}
+              {stock.above_vwap ? 'VWAP上方' : 'VWAP下方'}
             </div>
+          </div>
+          <div>
+            <div className="text-xl font-semibold text-purple-600">
+              {stock.ma20 ? `$${stock.ma20.toFixed(2)}` : '-'}
+            </div>
+            <div className="text-xs text-gray-500">MA20</div>
+          </div>
+        </div>
+        
+        {/* 日内数据 */}
+        <div className="grid grid-cols-4 gap-3 text-center mt-3 pt-3 border-t border-gray-200">
+          <div>
+            <div className="text-sm font-medium text-gray-700">
+              {stock.day_open ? `$${stock.day_open.toFixed(2)}` : '-'}
+            </div>
+            <div className="text-xs text-gray-400">开盘</div>
+          </div>
+          <div>
+            <div className="text-sm font-medium text-green-600">
+              {stock.day_high ? `$${stock.day_high.toFixed(2)}` : '-'}
+            </div>
+            <div className="text-xs text-gray-400">最高</div>
+          </div>
+          <div>
+            <div className="text-sm font-medium text-red-600">
+              {stock.day_low ? `$${stock.day_low.toFixed(2)}` : '-'}
+            </div>
+            <div className="text-xs text-gray-400">最低</div>
+          </div>
+          <div>
+            <div className="text-sm font-medium text-gray-700">
+              {stock.prev_close ? `$${stock.prev_close.toFixed(2)}` : '-'}
+            </div>
+            <div className="text-xs text-gray-400">昨收</div>
           </div>
         </div>
       </div>
@@ -346,6 +838,7 @@ function App() {
     tws_error: null
   });
   const [switchingSource, setSwitchingSource] = useState(false);
+  const [timezone, setTimezone] = useState<TimezoneOption>('ET');
 
   const toggleCardExpand = (symbol: string) => {
     setExpandedCards(prev => {
@@ -465,6 +958,24 @@ function App() {
             <h1 className="text-2xl font-bold text-gray-800">T-Trade Dashboard</h1>
           </div>
           <div className="flex items-center gap-4">
+            {/* 时区选择 */}
+            <div className="flex items-center gap-2 bg-gray-100 rounded-lg p-1">
+              <Globe className="w-4 h-4 text-gray-500 ml-2" />
+              {(['ET', 'LOCAL', 'UTC'] as TimezoneOption[]).map((tz) => (
+                <button
+                  key={tz}
+                  onClick={() => setTimezone(tz)}
+                  className={`px-2 py-1 rounded-md text-xs font-medium transition-colors ${
+                    timezone === tz
+                      ? 'bg-white text-indigo-600 shadow-sm'
+                      : 'text-gray-600 hover:text-gray-800'
+                  }`}
+                >
+                  {TIMEZONE_LABELS[tz]}
+                </button>
+              ))}
+            </div>
+            
             {/* 数据源切换 */}
             <div className="flex items-center gap-2 bg-gray-100 rounded-lg p-1">
               <button
@@ -533,6 +1044,7 @@ function App() {
             tradingAllowed={data.market_status.trading_allowed}
             tradingReason={data.market_status.trading_reason}
             currentTime={data.market_status.current_time}
+            timezone={timezone}
           />
         )}
 
