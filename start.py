@@ -44,12 +44,15 @@ def run_command(cmd, cwd=None, background=False):
     """运行命令"""
     print(f"[RUN] {' '.join(cmd)}")
     
+    is_windows = platform.system() == "Windows"
+    
     if background:
-        if platform.system() == "Windows":
-            # Windows 后台进程
+        if is_windows:
+            # Windows 后台进程 - 需要 shell=True 来找到 npm 等命令
             return subprocess.Popen(
-                cmd,
+                " ".join(cmd),
                 cwd=cwd,
+                shell=True,
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -64,7 +67,10 @@ def run_command(cmd, cwd=None, background=False):
                 stderr=subprocess.STDOUT,
             )
     else:
-        return subprocess.run(cmd, cwd=cwd)
+        if is_windows:
+            return subprocess.run(" ".join(cmd), cwd=cwd, shell=True)
+        else:
+            return subprocess.run(cmd, cwd=cwd)
 
 
 def install_frontend_deps():
