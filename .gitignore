@@ -32,6 +32,13 @@ env/
 *.swo
 *~
 
+# Node.js / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+*.log
+npm-debug.log*
+
 # 环境变量
 .env
 .env.local
