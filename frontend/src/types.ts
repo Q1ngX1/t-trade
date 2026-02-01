@@ -31,8 +31,15 @@ export interface DashboardData {
   market_status: MarketStatus;
   watchlist: string[];
   stocks: StockStatus[];
+  data_source: string;  // yahoo 或 tws
 }
 
 export interface WatchlistResponse {
   symbols: string[];
+}
+
+export interface DataSourceStatus {
+  current: string;  // yahoo 或 tws
+  tws_available: boolean;
+  tws_error: string | null;
 }

@@ -97,3 +97,42 @@ export async function addToWatchlistWithValidation(symbol: string): Promise<{ su
   
   return { success: true, data: await response.json() };
 }
+
+// Data Source API
+export interface DataSourceStatus {
+  current: string;
+  tws_available: boolean;
+  tws_error: string | null;
+}
+
+export async function getDataSource(): Promise<DataSourceStatus> {
+  const response = await fetch(`${API_BASE}/datasource`);
+  if (!response.ok) {
+    throw new Error('Failed to get data source');
+  }
+  return response.json();
+}
+
+export async function setDataSource(source: string): Promise<DataSourceStatus> {
+  const response = await fetch(`${API_BASE}/datasource`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ source }),
+  });
+  if (!response.ok) {
+    throw new Error('Failed to set data source');
+  }
+  return response.json();
+}
+
+export async function connectTws(port: number = 7497): Promise<{ success: boolean; message: string; data_source: string }> {
+  const response = await fetch(`${API_BASE}/datasource/connect-tws?port=${port}`, {
+    method: 'POST',
+  });
+  if (!response.ok) {
+    throw new Error('Failed to connect to TWS');
+  }
+  return response.json();
+}

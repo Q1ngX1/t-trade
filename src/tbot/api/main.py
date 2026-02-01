@@ -84,6 +84,19 @@ class DashboardResponse(BaseModel):
     market_status: MarketStatusResponse
     watchlist: list[str]
     stocks: list[StockStatus]
+    data_source: str = "yahoo"  # 当前数据源
+
+
+class DataSourceStatus(BaseModel):
+    """数据源状态"""
+    current: str  # yahoo 或 tws
+    tws_available: bool
+    tws_error: str | None = None
+
+
+class DataSourceRequest(BaseModel):
+    """切换数据源请求"""
+    source: str  # yahoo 或 tws
 
 
 # ============== 全局状态 ==============
@@ -92,6 +105,7 @@ watchlist_manager: WatchlistManager | None = None
 stock_cache: dict[str, StockStatus] = {}
 stock_price_cache: dict[str, dict[str, Any]] = {}  # 缓存真实股票数据
 ibkr_client: Any = None
+current_data_source: str = "yahoo"  # 当前数据源: yahoo 或 tws
 
 
 @asynccontextmanager
@@ -143,6 +157,172 @@ async def root():
 async def health_check():
     """健康检查"""
     return {"status": "ok", "timestamp": get_et_now().isoformat()}
+
+
+# -------------- Data Source API --------------
+
+@app.get("/api/datasource", response_model=DataSourceStatus)
+async def get_data_source():
+    """获取当前数据源状态"""
+    global ibkr_client
+    
+    tws_available = False
+    tws_error = None
+    
+    if ibkr_client is not None:
+        tws_available = ibkr_client.is_connected
+        if not tws_available:
+            tws_error = "TWS 连接已断开"
+    else:
+        tws_error = "TWS 客户端未初始化"
+    
+    return DataSourceStatus(
+        current=current_data_source,
+        tws_available=tws_available,
+        tws_error=tws_error
+    )
+
+
+@app.post("/api/datasource", response_model=DataSourceStatus)
+async def set_data_source(request: DataSourceRequest):
+    """切换数据源"""
+    global current_data_source, ibkr_client
+    
+    source = request.source.lower()
+    
+    if source not in ("yahoo", "tws"):
+        raise HTTPException(status_code=400, detail="数据源必须是 'yahoo' 或 'tws'")
+    
+    tws_available = False
+    tws_error = None
+    
+    if source == "tws":
+        # 尝试连接 TWS（在线程池中运行，需要创建新的事件循环）
+        import concurrent.futures
+        import threading
+        
+        # 用于存储结果
+        result = {"success": False, "error": None}
+        
+        def connect_tws_in_thread():
+            """在独立线程中连接 TWS（ib_insync 需要自己的事件循环）"""
+            global ibkr_client
+            import asyncio
+            
+            # 为此线程创建新的事件循环（必须在导入 ib_insync 之前）
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            try:
+                # 在设置好事件循环后再导入和创建 IBKRClient
+                from tbot.brokers.ibkr_client import IBKRClient
+                
+                if ibkr_client is None or not ibkr_client.is_connected:
+                    ibkr_client = IBKRClient(port=7497, client_id=10, timeout=10)
+                    result["success"] = ibkr_client.connect_sync()
+                else:
+                    result["success"] = True
+            except Exception as e:
+                result["error"] = str(e)
+                result["success"] = False
+        
+        try:
+            # 使用 Thread 而不是 ThreadPoolExecutor
+            thread = threading.Thread(target=connect_tws_in_thread)
+            thread.start()
+            thread.join(timeout=15)  # 等待最多 15 秒
+            
+            if thread.is_alive():
+                tws_error = "TWS 连接超时"
+                current_data_source = "yahoo"
+            elif result["success"]:
+                tws_available = True
+                current_data_source = "tws"
+                logger.info("成功连接到 TWS，切换数据源为 TWS")
+            else:
+                tws_error = result["error"] or "无法连接到 TWS"
+                current_data_source = "yahoo"
+                logger.warning(f"TWS 连接失败: {tws_error}")
+        except Exception as e:
+            tws_error = f"TWS 连接错误: {str(e)}"
+            current_data_source = "yahoo"
+            logger.error(f"TWS 连接异常: {e}")
+    else:
+        # 切换回 Yahoo
+        current_data_source = "yahoo"
+        if ibkr_client is not None and ibkr_client.is_connected:
+            tws_available = True
+    
+    return DataSourceStatus(
+        current=current_data_source,
+        tws_available=tws_available,
+        tws_error=tws_error
+    )
+
+
+@app.post("/api/datasource/connect-tws")
+async def connect_tws(port: int = 7497):
+    """手动连接 TWS"""
+    global ibkr_client, current_data_source
+    
+    import threading
+    
+    result = {"success": False, "error": None}
+    
+    def do_connect():
+        """在独立线程中连接 TWS"""
+        global ibkr_client
+        import asyncio
+        
+        # 为此线程创建新的事件循环
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            from tbot.brokers.ibkr_client import IBKRClient
+            
+            # 断开旧连接
+            if ibkr_client is not None and ibkr_client.is_connected:
+                ibkr_client.disconnect()
+            
+            ibkr_client = IBKRClient(port=port, client_id=10, timeout=10)
+            result["success"] = ibkr_client.connect_sync()
+        except Exception as e:
+            result["error"] = str(e)
+            result["success"] = False
+    
+    try:
+        thread = threading.Thread(target=do_connect)
+        thread.start()
+        thread.join(timeout=15)
+        
+        if thread.is_alive():
+            return {
+                "success": False,
+                "message": "连接超时",
+                "data_source": "yahoo"
+            }
+        
+        if result["success"]:
+            current_data_source = "tws"
+            return {
+                "success": True,
+                "message": f"成功连接到 TWS (端口 {port})",
+                "data_source": "tws"
+            }
+        else:
+            return {
+                "success": False,
+                "message": result["error"] or "无法连接到 TWS，请确保 TWS 已启动并启用 API",
+                "data_source": "yahoo"
+            }
+    except Exception as e:
+        logger.error(f"连接 TWS 失败: {e}")
+        return {
+            "success": False,
+            "message": f"连接错误: {str(e)}",
+            "data_source": "yahoo"
+        }
 
 
 # -------------- Watchlist API --------------
@@ -306,14 +486,22 @@ async def get_dashboard():
     # Watchlist
     symbols = watchlist_manager.get_all()
     
-    # 股票状态 - 并发获取真实数据
-    tasks = [get_real_stock_status(symbol) for symbol in symbols]
+    # 统一使用 Yahoo Finance 获取数据（稳定可靠）
+    # TWS 模式只表示已建立 TWS 连接，但实际数据仍来自 Yahoo
+    tasks = [get_yahoo_stock_status(symbol) for symbol in symbols]
     stocks = await asyncio.gather(*tasks)
+    
+    # 确定数据源标识
+    if current_data_source == "tws" and ibkr_client is not None and ibkr_client.is_connected:
+        actual_source = "tws"  # 已连接 TWS（数据来自 Yahoo）
+    else:
+        actual_source = "yahoo"
     
     return DashboardResponse(
         market_status=market_status,
         watchlist=symbols,
         stocks=list(stocks),
+        data_source=actual_source,
     )
 
 
@@ -395,8 +583,8 @@ async def fetch_yahoo_quote(symbol: str) -> dict[str, Any] | None:
         return None
 
 
-async def get_real_stock_status(symbol: str) -> StockStatus:
-    """获取真实股票状态（使用 Yahoo Finance）"""
+async def get_yahoo_stock_status(symbol: str) -> StockStatus:
+    """获取股票状态（使用 Yahoo Finance）"""
     
     # 尝试获取真实数据
     quote = await fetch_yahoo_quote(symbol)
@@ -481,6 +669,17 @@ async def get_real_stock_status(symbol: str) -> StockStatus:
         regime_reasons=["无法获取股票数据"],
         updated_at=get_et_now().strftime("%H:%M:%S"),
     )
+
+
+# ============== 简化版 TWS 模式 ==============
+# 说明：由于 ib_insync 的事件循环限制，TWS 数据获取在 FastAPI 异步环境中无法正常工作
+# 当前策略：TWS 模式仅表示已建立 TWS 连接，实际股票数据统一来自 Yahoo Finance
+# 未来计划：Phase B 将实现独立的 TWSDataService 后台服务
+
+
+async def get_real_stock_status(symbol: str) -> StockStatus:
+    """获取真实股票状态（统一使用 Yahoo Finance）"""
+    return await get_yahoo_stock_status(symbol)
 
 
 def main():

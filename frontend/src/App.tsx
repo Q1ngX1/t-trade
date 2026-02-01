@@ -9,10 +9,13 @@ import {
   RefreshCw,
   Clock,
   CheckCircle,
-  XCircle
+  XCircle,
+  Database,
+  Wifi,
+  WifiOff
 } from 'lucide-react';
-import { DashboardData, StockStatus } from './types';
-import { fetchDashboard, addToWatchlistWithValidation, removeFromWatchlist } from './api';
+import { DashboardData, StockStatus, DataSourceStatus } from './types';
+import { fetchDashboard, addToWatchlistWithValidation, removeFromWatchlist, getDataSource, setDataSource } from './api';
 
 // ============== 辅助函数 ==============
 
@@ -337,6 +340,12 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set());
+  const [dataSource, setDataSourceState] = useState<DataSourceStatus>({
+    current: 'yahoo',
+    tws_available: false,
+    tws_error: null
+  });
+  const [switchingSource, setSwitchingSource] = useState(false);
 
   const toggleCardExpand = (symbol: string) => {
     setExpandedCards(prev => {
@@ -353,8 +362,12 @@ function App() {
   const loadData = useCallback(async (showRefresh = false) => {
     try {
       if (showRefresh) setRefreshing(true);
-      const dashboard = await fetchDashboard();
+      const [dashboard, dsStatus] = await Promise.all([
+        fetchDashboard(),
+        getDataSource()
+      ]);
       setData(dashboard);
+      setDataSourceState(dsStatus);
       setError(null);
     } catch (err) {
       setError('无法连接到服务器，请确保后端已启动');
@@ -364,6 +377,20 @@ function App() {
       setRefreshing(false);
     }
   }, []);
+
+  const handleSwitchDataSource = async (source: string) => {
+    setSwitchingSource(true);
+    try {
+      const result = await setDataSource(source);
+      setDataSourceState(result);
+      // 重新加载数据
+      await loadData();
+    } catch (err) {
+      console.error('切换数据源失败:', err);
+    } finally {
+      setSwitchingSource(false);
+    }
+  };
 
   useEffect(() => {
     loadData();
@@ -437,14 +464,62 @@ function App() {
             <Activity className="w-8 h-8 text-blue-500" />
             <h1 className="text-2xl font-bold text-gray-800">T-Trade Dashboard</h1>
           </div>
-          <button
-            onClick={() => loadData(true)}
-            disabled={refreshing}
-            className="flex items-center gap-2 px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg disabled:opacity-50"
-          >
-            <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
-            刷新
-          </button>
+          <div className="flex items-center gap-4">
+            {/* 数据源切换 */}
+            <div className="flex items-center gap-2 bg-gray-100 rounded-lg p-1">
+              <button
+                onClick={() => handleSwitchDataSource('yahoo')}
+                disabled={switchingSource || dataSource.current === 'yahoo'}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  dataSource.current === 'yahoo'
+                    ? 'bg-white text-blue-600 shadow-sm'
+                    : 'text-gray-600 hover:text-gray-800'
+                }`}
+              >
+                <Database className="w-4 h-4" />
+                Yahoo
+              </button>
+              <button
+                onClick={() => handleSwitchDataSource('tws')}
+                disabled={switchingSource}
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
+                  dataSource.current === 'tws'
+                    ? 'bg-white text-green-600 shadow-sm'
+                    : 'text-gray-600 hover:text-gray-800'
+                }`}
+                title={dataSource.tws_error || '连接 TWS（数据仍来自 Yahoo）'}
+              >
+                {dataSource.tws_available ? (
+                  <Wifi className="w-4 h-4 text-green-500" />
+                ) : (
+                  <WifiOff className="w-4 h-4 text-gray-400" />
+                )}
+                TWS
+                {switchingSource && dataSource.current !== 'tws' && (
+                  <RefreshCw className="w-3 h-3 animate-spin" />
+                )}
+              </button>
+            </div>
+            {/* 数据源状态提示 */}
+            {dataSource.current === 'tws' && (
+              <span className="text-xs text-green-600 bg-green-50 px-2 py-1 rounded" title="已连接 TWS，数据来自 Yahoo">
+                🟢 TWS 已连接
+              </span>
+            )}
+            {dataSource.tws_error && dataSource.current !== 'tws' && (
+              <span className="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded" title={dataSource.tws_error}>
+                TWS 未连接
+              </span>
+            )}
+            <button
+              onClick={() => loadData(true)}
+              disabled={refreshing}
+              className="flex items-center gap-2 px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg disabled:opacity-50"
+            >
+              <RefreshCw className={`w-4 h-4 ${refreshing ? 'animate-spin' : ''}`} />
+              刷新
+            </button>
+          </div>
         </div>
       </header>
 
@@ -513,7 +588,13 @@ function App() {
 
       {/* 页脚 */}
       <footer className="text-center py-4 text-gray-400 text-sm">
-        T-Trade v0.1.0 | 仅供参考，不构成投资建议
+        <div className="flex items-center justify-center gap-2">
+          <span>T-Trade v0.1.0</span>
+          <span>|</span>
+          <span>数据源: Yahoo Finance {data?.data_source === 'tws' ? '(🟢 TWS 已连接)' : ''}</span>
+          <span>|</span>
+          <span>仅供参考，不构成投资建议</span>
+        </div>
       </footer>
     </div>
   );
