@@ -40,19 +40,29 @@
 # 安装依赖
 uv sync
 
-# 启动 Web 仪表盘后端
+# 一键启动 Web 仪表盘 (推荐)
+python start.py web
+
+# 或使用平台脚本
+./start.sh web     # macOS/Linux
+start.bat web      # Windows
+
+# 其他模式
+python start.py cli      # CLI 模式 (连接 TWS)
+python start.py demo     # 演示模式 (无需 TWS)
+python start.py --help   # 查看帮助
+```
+
+### 手动启动
+
+```bash
+# 启动后端
 uv run uvicorn tbot.api.main:app --port 8000
 
 # 启动前端 (新终端)
 cd frontend && npm install && npm run dev
 
 # 访问 http://localhost:5173
-
-# CLI 模式 - 演示 (无需 IBKR)
-uv run tbot demo
-
-# CLI 模式 - 连接 TWS
-uv run tbot run --port 7497
 ```
 
 ## 配置
